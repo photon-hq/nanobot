@@ -36,6 +36,8 @@ _DEFAULT_DB_PATH = str(Path.home() / "Library" / "Messages" / "chat.db")
 _LOCAL_POLL_INTERVAL = 2.0
 _REMOTE_POLL_INTERVAL = 2.0
 
+_AUDIO_EXTENSIONS = frozenset({".m4a", ".mp3", ".wav", ".aac", ".ogg", ".caf", ".opus"})
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -54,6 +56,7 @@ class IMessageConfig(Base):
     database_path: str = _DEFAULT_DB_PATH
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
+    reply_to_message: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -168,23 +171,39 @@ class IMessageChannel(BaseChannel):
                 m.service,
                 h.id AS sender,
                 c.chat_identifier,
-                c.style AS chat_style
+                c.style AS chat_style,
+                a.ROWID AS att_rowid,
+                a.filename AS att_filename,
+                a.mime_type AS att_mime,
+                a.transfer_name AS att_transfer_name
             FROM message m
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
             LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+            LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
+            LEFT JOIN attachment a ON maj.attachment_id = a.ROWID
             WHERE m.ROWID > ?
             ORDER BY m.ROWID ASC
             """,
             (self._last_rowid,),
         )
-        results = []
+        msg_map: dict[int, dict[str, Any]] = {}
         for row in cur:
             d = dict(row)
-            self._last_rowid = max(self._last_rowid, d["ROWID"])
-            results.append(d)
+            rowid = d["ROWID"]
+            if rowid not in msg_map:
+                msg_map[rowid] = {**d, "attachments": []}
+            if d.get("att_rowid"):
+                raw_path = d.get("att_filename") or ""
+                resolved = raw_path.replace("~", str(Path.home()), 1) if raw_path.startswith("~") else raw_path
+                msg_map[rowid]["attachments"].append({
+                    "filename": resolved,
+                    "mime_type": d.get("att_mime") or "",
+                    "transfer_name": d.get("att_transfer_name") or "",
+                })
+            self._last_rowid = max(self._last_rowid, rowid)
         conn.close()
-        return results
+        return list(msg_map.values())
 
     async def _handle_local_message(self, row: dict[str, Any]) -> None:
         if row.get("is_from_me"):
@@ -202,10 +221,32 @@ class IMessageChannel(BaseChannel):
         if is_group and self.config.group_policy == "mention":
             return
 
+        media_paths: list[str] = []
+        for att in row.get("attachments") or []:
+            file_path = att.get("filename", "")
+            if not file_path or not Path(file_path).exists():
+                continue
+
+            mime = att.get("mime_type") or ""
+            ext = Path(file_path).suffix.lower()
+
+            if ext in _AUDIO_EXTENSIONS or mime.startswith("audio/"):
+                transcription = await self.transcribe_audio(file_path)
+                if transcription:
+                    voice_tag = f"[Voice Message: {transcription}]"
+                    content = f"{content}\n{voice_tag}" if content else voice_tag
+                    continue
+
+            media_paths.append(file_path)
+            tag = "image" if mime.startswith("image/") else "file"
+            media_tag = f"[{tag}: {file_path}]"
+            content = f"{content}\n{media_tag}" if content else media_tag
+
         await self._handle_message(
             sender_id=sender,
             chat_id=chat_id,
             content=content,
+            media=media_paths,
             metadata={
                 "message_id": message_id,
                 "service": row.get("service", "iMessage"),
@@ -383,14 +424,27 @@ class IMessageChannel(BaseChannel):
         for att in data.get("attachments") or []:
             att_guid = att.get("guid", "")
             name = att.get("transferName") or att.get("filename") or ""
-            if att_guid and self._http:
-                local_path = await self._download_attachment(att_guid, name)
-                if local_path:
-                    media_paths.append(local_path)
-                    mime, _ = mimetypes.guess_type(local_path)
-                    tag = "image" if mime and mime.startswith("image/") else "file"
-                    media_tag = f"[{tag}: {local_path}]"
-                    content = f"{content}\n{media_tag}" if content else media_tag
+            if not att_guid or not self._http:
+                continue
+
+            local_path = await self._download_attachment(att_guid, name)
+            if not local_path:
+                continue
+
+            mime, _ = mimetypes.guess_type(local_path)
+            ext = Path(local_path).suffix.lower()
+
+            if ext in _AUDIO_EXTENSIONS or (mime and mime.startswith("audio/")):
+                transcription = await self.transcribe_audio(local_path)
+                if transcription:
+                    voice_tag = f"[Voice Message: {transcription}]"
+                    content = f"{content}\n{voice_tag}" if content else voice_tag
+                    continue
+
+            media_paths.append(local_path)
+            tag = "image" if mime and mime.startswith("image/") else "file"
+            media_tag = f"[{tag}: {local_path}]"
+            content = f"{content}\n{media_tag}" if content else media_tag
 
         await self._handle_message(
             sender_id=sender,
@@ -430,11 +484,11 @@ class IMessageChannel(BaseChannel):
         chat_guid = msg.chat_id
 
         if msg.content:
+            body: dict[str, Any] = {"chatGuid": chat_guid, "message": msg.content}
+            if self.config.reply_to_message and msg.reply_to:
+                body["selectedMessageGuid"] = msg.reply_to
             try:
-                await self._http.post(
-                    "/api/v1/message/text",
-                    json={"chatGuid": chat_guid, "message": msg.content},
-                )
+                await self._http.post("/api/v1/message/text", json=body)
             except Exception as e:
                 logger.error("iMessage remote send failed: {}", e)
                 raise
