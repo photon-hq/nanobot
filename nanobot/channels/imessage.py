@@ -6,14 +6,19 @@ Supports two modes via Photon's iMessage platform:
   (``~/Library/Messages/chat.db``) via ``sqlite3`` and sends through
   AppleScript.  No external server required.
 
-  **Remote** — Any platform.  Connects to a Photon-managed iMessage
-  server over pure HTTP using ``httpx``.  Polls for new messages and
-  sends via REST API.  Supports HTTP proxy for all traffic.
+  **Remote** — Any platform.  Connects to a Photon
+  `advanced-imessage-http-proxy <https://github.com/photon-hq/advanced-imessage-http-proxy>`_
+  over pure HTTP.  Polls ``GET /messages`` for inbound, sends via
+  ``POST /send``, and supports the full feature set (tapback reactions,
+  typing indicators, mark-as-read, attachments, reply-to).
+  All traffic goes through ``httpx`` so the optional ``proxy`` config
+  is respected everywhere.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import mimetypes
 import platform
 import sqlite3
@@ -61,6 +66,42 @@ class IMessageConfig(Base):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_bearer_token(server_url: str, api_key: str) -> str:
+    """Build the Bearer token expected by advanced-imessage-http-proxy.
+
+    If the key already looks like a base64 blob (contains ``|`` when decoded
+    or is long enough) it is used verbatim.  Otherwise we encode
+    ``serverUrl|apiKey`` per the proxy's auth spec.
+    """
+    try:
+        decoded = base64.b64decode(api_key, validate=True).decode()
+        if "|" in decoded:
+            return api_key
+    except Exception:
+        pass
+    raw = f"{server_url}|{api_key}"
+    return base64.b64encode(raw.encode()).decode()
+
+
+def _extract_address(chat_id: str) -> str:
+    """Convert a chatGuid or raw address to the proxy's address format.
+
+    ``iMessage;-;+1234567890`` → ``+1234567890``
+    ``iMessage;+;chat123``     → ``group:chat123``
+    ``+1234567890``            → ``+1234567890`` (passthrough)
+    """
+    if ";-;" in chat_id:
+        return chat_id.split(";-;", 1)[1]
+    if ";+;" in chat_id:
+        return "group:" + chat_id.split(";+;", 1)[1]
+    return chat_id
+
+
+# ---------------------------------------------------------------------------
 # Channel
 # ---------------------------------------------------------------------------
 
@@ -71,9 +112,9 @@ class IMessageChannel(BaseChannel):
     Local mode reads from the native iMessage SQLite database and sends
     via AppleScript — pure Python, no external dependencies.
 
-    Remote mode uses pure HTTP to talk to a Photon iMessage server,
-    polling for new messages via the REST API.  All traffic goes through
-    ``httpx`` so the optional ``proxy`` config is respected everywhere.
+    Remote mode talks to a Photon ``advanced-imessage-http-proxy`` server.
+    See https://github.com/photon-hq/advanced-imessage-http-proxy for the
+    full API reference.
     """
 
     name = "imessage"
@@ -305,18 +346,16 @@ class IMessageChannel(BaseChannel):
             raise
 
     # ======================================================================
-    # REMOTE MODE  (Photon server — pure HTTP polling)
+    # REMOTE MODE  (advanced-imessage-http-proxy)
+    # https://github.com/photon-hq/advanced-imessage-http-proxy
     # ======================================================================
 
     def _build_http_client(self) -> httpx.AsyncClient:
-        proxy = self.config.proxy or None
+        token = _make_bearer_token(self.config.server_url, self.config.api_key)
         return httpx.AsyncClient(
             base_url=self.config.server_url.rstrip("/"),
-            headers={
-                "X-API-Key": self.config.api_key,
-                "Content-Type": "application/json",
-            },
-            proxy=proxy,
+            headers={"Authorization": f"Bearer {token}"},
+            proxy=self.config.proxy or None,
             timeout=30.0,
         )
 
@@ -330,6 +369,9 @@ class IMessageChannel(BaseChannel):
 
         self._running = True
         self._http = self._build_http_client()
+
+        if not await self._health_check():
+            logger.error("iMessage server health check failed — will retry in poll loop")
 
         self._last_message_date = await self._get_server_latest_timestamp()
         poll_interval = max(0.5, self.config.poll_interval)
@@ -346,34 +388,45 @@ class IMessageChannel(BaseChannel):
                 logger.warning("iMessage remote poll error: {}", e)
             await asyncio.sleep(poll_interval)
 
-    async def _get_server_latest_timestamp(self) -> int:
-        """Fetch the most recent message timestamp so we only poll forward."""
+    async def _health_check(self) -> bool:
+        """``GET /health`` — verify the proxy is reachable."""
+        if not self._http:
+            return False
         try:
-            resp = await self._http.get(  # type: ignore[union-attr]
-                "/api/v1/message",
-                params={"limit": 1, "sort": "DESC"},
-            )
+            resp = await self._http.get("/health")
             if resp.is_success:
-                data = resp.json()
-                messages = data.get("data") or data if isinstance(data, list) else []
-                if isinstance(data, dict):
-                    messages = data.get("data") or data.get("messages") or []
-                if messages and isinstance(messages, list):
+                logger.info("iMessage server health check passed")
+                return True
+            logger.warning("iMessage health check HTTP {}", resp.status_code)
+        except Exception as e:
+            logger.warning("iMessage health check failed: {}", e)
+        return False
+
+    async def _get_server_latest_timestamp(self) -> int:
+        """Fetch the most recent message timestamp to seed the poll cursor."""
+        try:
+            resp = await self._http.get("/messages", params={"limit": 1})  # type: ignore[union-attr]
+            if resp.is_success:
+                body = resp.json()
+                messages = body.get("data") if isinstance(body, dict) else body
+                if isinstance(messages, list) and messages:
                     return messages[0].get("dateCreated", 0)
         except Exception as e:
             logger.debug("Could not seed latest timestamp: {}", e)
         return 0
 
+    # ---- inbound -----------------------------------------------------------
+
     async def _poll_remote(self) -> None:
         if not self._http:
             return
 
-        params: dict[str, Any] = {"sort": "DESC", "limit": 50}
+        params: dict[str, Any] = {"limit": 50}
         if self._last_message_date:
             params["after"] = self._last_message_date
 
         try:
-            resp = await self._http.get("/api/v1/message", params=params)
+            resp = await self._http.get("/messages", params=params)
         except httpx.HTTPError as e:
             logger.warning("iMessage poll request failed: {}", e)
             return
@@ -382,12 +435,10 @@ class IMessageChannel(BaseChannel):
             logger.warning("iMessage poll HTTP {}: {}", resp.status_code, resp.text[:200])
             return
 
-        data = resp.json()
-        messages: list[dict[str, Any]] = []
-        if isinstance(data, list):
-            messages = data
-        elif isinstance(data, dict):
-            messages = data.get("data") or data.get("messages") or []
+        body = resp.json()
+        messages: list[dict[str, Any]] = body.get("data") if isinstance(body, dict) else body
+        if not isinstance(messages, list):
+            return
 
         for msg in reversed(messages):
             ts = msg.get("dateCreated", 0)
@@ -415,11 +466,15 @@ class IMessageChannel(BaseChannel):
         if not chat_guid:
             chat_guid = data.get("chatGuid", sender)
 
+        address = _extract_address(chat_guid) or sender
         content = data.get("text") or ""
-        is_group = ";+;" in chat_guid
+        is_group = ";+;" in chat_guid or address.startswith("group:")
 
         if is_group and self.config.group_policy == "mention":
             return
+
+        await self._add_tapback(address, message_id)
+        await self._mark_read(address)
 
         media_paths: list[str] = []
         for att in data.get("attachments") or []:
@@ -447,43 +502,104 @@ class IMessageChannel(BaseChannel):
             media_tag = f"[{tag}: {local_path}]"
             content = f"{content}\n{media_tag}" if content else media_tag
 
-        await self._add_tapback(chat_guid, message_id, self.config.react_tapback)
-
         await self._handle_message(
             sender_id=sender,
-            chat_id=chat_guid,
+            chat_id=address,
             content=content,
             media=media_paths,
             metadata={
                 "message_id": message_id,
+                "chat_guid": chat_guid,
                 "is_group": is_group,
                 "source": "remote",
                 "timestamp": data.get("dateCreated"),
             },
         )
 
-    async def _add_tapback(self, chat_guid: str, message_guid: str, reaction: str) -> None:
-        """Add a tapback reaction to an inbound message (remote only, best-effort)."""
+    # ---- outbound ----------------------------------------------------------
+
+    async def _send_remote(self, msg: OutboundMessage) -> None:
+        if not self._http:
+            logger.warning("iMessage remote HTTP client not initialised")
+            return
+
+        to = msg.chat_id
+
+        await self._start_typing(to)
+
+        if msg.content:
+            body: dict[str, Any] = {"to": to, "text": msg.content}
+            if self.config.reply_to_message and msg.reply_to:
+                body["replyTo"] = msg.reply_to
+            try:
+                await self._http.post("/send", json=body)
+            except Exception as e:
+                logger.error("iMessage remote send failed: {}", e)
+                raise
+            finally:
+                await self._stop_typing(to)
+
+        for media_path in msg.media or []:
+            try:
+                mime, _ = mimetypes.guess_type(media_path)
+                with open(media_path, "rb") as f:
+                    await self._http.post(
+                        "/send/file",
+                        data={"to": to},
+                        files={"file": (Path(media_path).name, f, mime or "application/octet-stream")},
+                    )
+            except Exception as e:
+                logger.error("iMessage remote media send failed: {}", e)
+                raise
+
+    # ---- remote helpers (best-effort, non-blocking) ------------------------
+
+    async def _add_tapback(self, address: str, message_guid: str) -> None:
+        """``POST /messages/:id/react`` — add tapback on inbound message."""
+        reaction = self.config.react_tapback
         if not self._http or not reaction:
             return
         try:
             await self._http.post(
-                "/api/v1/message/react",
-                json={
-                    "chatGuid": chat_guid,
-                    "selectedMessageGuid": message_guid,
-                    "reaction": reaction,
-                },
+                f"/messages/{message_guid}/react",
+                json={"chat": address, "type": reaction},
             )
         except Exception as e:
             logger.debug("iMessage tapback failed: {}", e)
 
+    async def _mark_read(self, address: str) -> None:
+        """``POST /chats/:id/read`` — clear unread badge after processing."""
+        if not self._http:
+            return
+        try:
+            await self._http.post(f"/chats/{address}/read")
+        except Exception as e:
+            logger.debug("iMessage mark-read failed: {}", e)
+
+    async def _start_typing(self, address: str) -> None:
+        """``POST /chats/:id/typing`` — show typing indicator."""
+        if not self._http:
+            return
+        try:
+            await self._http.post(f"/chats/{address}/typing")
+        except Exception as e:
+            logger.debug("iMessage typing start failed: {}", e)
+
+    async def _stop_typing(self, address: str) -> None:
+        """``DELETE /chats/:id/typing`` — stop typing indicator."""
+        if not self._http:
+            return
+        try:
+            await self._http.request("DELETE", f"/chats/{address}/typing")
+        except Exception as e:
+            logger.debug("iMessage typing stop failed: {}", e)
+
     async def _download_attachment(self, att_guid: str, filename: str) -> str | None:
-        """Download an attachment from the Photon server to local media dir."""
+        """``GET /attachments/:id`` — download to local media dir."""
         if not self._http:
             return None
         try:
-            resp = await self._http.get(f"/api/v1/attachment/{att_guid}/download")
+            resp = await self._http.get(f"/attachments/{att_guid}")
             if not resp.is_success:
                 return None
             media_dir = get_media_dir("imessage")
@@ -494,36 +610,6 @@ class IMessageChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to download iMessage attachment {}: {}", att_guid, e)
             return None
-
-    async def _send_remote(self, msg: OutboundMessage) -> None:
-        if not self._http:
-            logger.warning("iMessage remote HTTP client not initialised")
-            return
-
-        chat_guid = msg.chat_id
-
-        if msg.content:
-            body: dict[str, Any] = {"chatGuid": chat_guid, "message": msg.content}
-            if self.config.reply_to_message and msg.reply_to:
-                body["selectedMessageGuid"] = msg.reply_to
-            try:
-                await self._http.post("/api/v1/message/text", json=body)
-            except Exception as e:
-                logger.error("iMessage remote send failed: {}", e)
-                raise
-
-        for media_path in msg.media or []:
-            try:
-                mime, _ = mimetypes.guess_type(media_path)
-                with open(media_path, "rb") as f:
-                    await self._http.post(
-                        "/api/v1/attachment",
-                        data={"chatGuid": chat_guid},
-                        files={"file": (Path(media_path).name, f, mime or "application/octet-stream")},
-                    )
-            except Exception as e:
-                logger.error("iMessage remote media send failed: {}", e)
-                raise
 
     # ---- dedup helper ------------------------------------------------------
 
