@@ -57,6 +57,7 @@ class IMessageConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
     reply_to_message: bool = False
+    react_tapback: str = "love"
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +447,8 @@ class IMessageChannel(BaseChannel):
             media_tag = f"[{tag}: {local_path}]"
             content = f"{content}\n{media_tag}" if content else media_tag
 
+        await self._add_tapback(chat_guid, message_id, self.config.react_tapback)
+
         await self._handle_message(
             sender_id=sender,
             chat_id=chat_guid,
@@ -458,6 +461,22 @@ class IMessageChannel(BaseChannel):
                 "timestamp": data.get("dateCreated"),
             },
         )
+
+    async def _add_tapback(self, chat_guid: str, message_guid: str, reaction: str) -> None:
+        """Add a tapback reaction to an inbound message (remote only, best-effort)."""
+        if not self._http or not reaction:
+            return
+        try:
+            await self._http.post(
+                "/api/v1/message/react",
+                json={
+                    "chatGuid": chat_guid,
+                    "selectedMessageGuid": message_guid,
+                    "reaction": reaction,
+                },
+            )
+        except Exception as e:
+            logger.debug("iMessage tapback failed: {}", e)
 
     async def _download_attachment(self, att_guid: str, filename: str) -> str | None:
         """Download an attachment from the Photon server to local media dir."""
