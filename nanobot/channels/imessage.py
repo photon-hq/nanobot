@@ -9,8 +9,39 @@ Supports two modes via Photon's iMessage platform:
   **Remote** — Any platform.  Connects to a Photon
   `advanced-imessage-http-proxy <https://github.com/photon-hq/advanced-imessage-http-proxy>`_
   over pure HTTP.  Polls ``GET /messages`` for inbound, sends via
-  ``POST /send``, and supports the full feature set (tapback reactions,
-  typing indicators, mark-as-read, attachments, reply-to).
+  ``POST /send``, and supports the full proxy feature set:
+
+    - ``POST /send`` — text with optional effects and inline replies
+    - ``POST /send/file`` — images, files, audio messages
+    - ``POST /send/sticker`` — standalone or reply stickers
+    - ``DELETE /messages/:id`` — unsend / retract a message
+    - ``POST /messages/:id/react`` — add tapback
+    - ``DELETE /messages/:id/react`` — remove tapback
+    - ``GET /messages`` — poll for new messages
+    - ``GET /messages/search`` — search by text
+    - ``GET /messages/:id`` — get single message
+    - ``GET /chats`` — list conversations
+    - ``GET /chats/:id`` — chat details
+    - ``GET /chats/:id/messages`` — chat history
+    - ``GET /chats/:id/participants`` — group participants
+    - ``POST /chats/:id/read`` — mark as read
+    - ``POST /chats/:id/typing`` — start typing indicator
+    - ``DELETE /chats/:id/typing`` — stop typing indicator
+    - ``POST /groups`` — create group chat
+    - ``PATCH /groups/:id`` — rename group
+    - ``POST /polls`` — create poll
+    - ``GET /polls/:id`` — get poll
+    - ``POST /polls/:id/vote`` — vote on poll
+    - ``POST /polls/:id/unvote`` — remove vote
+    - ``POST /polls/:id/options`` — add poll option
+    - ``GET /attachments/:id`` — download attachment
+    - ``GET /attachments/:id/info`` — attachment metadata
+    - ``GET /check/:address`` — check iMessage availability
+    - ``GET /contacts`` — list contacts
+    - ``GET /handles`` — list handles
+    - ``GET /server`` — server info
+    - ``GET /health`` — health check
+
   All traffic goes through ``httpx`` so the optional ``proxy`` config
   is respected everywhere.
 """
@@ -63,6 +94,7 @@ class IMessageConfig(Base):
     group_policy: Literal["open", "mention"] = "open"
     reply_to_message: bool = False
     react_tapback: str = "love"
+    done_tapback: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +105,7 @@ class IMessageConfig(Base):
 def _make_bearer_token(server_url: str, api_key: str) -> str:
     """Build the Bearer token expected by advanced-imessage-http-proxy.
 
-    If the key already looks like a base64 blob (contains ``|`` when decoded
-    or is long enough) it is used verbatim.  Otherwise we encode
-    ``serverUrl|apiKey`` per the proxy's auth spec.
+    If the key already decodes to a ``url|key`` pair it is used as-is.
     """
     try:
         decoded = base64.b64decode(api_key, validate=True).decode()
@@ -88,7 +118,7 @@ def _make_bearer_token(server_url: str, api_key: str) -> str:
 
 
 def _extract_address(chat_id: str) -> str:
-    """Convert a chatGuid or raw address to the proxy's address format.
+    """Convert a chatGuid to the proxy's address format.
 
     ``iMessage;-;+1234567890`` → ``+1234567890``
     ``iMessage;+;chat123``     → ``group:chat123``
@@ -370,7 +400,7 @@ class IMessageChannel(BaseChannel):
         self._running = True
         self._http = self._build_http_client()
 
-        if not await self._health_check():
+        if not await self._api_health():
             logger.error("iMessage server health check failed — will retry in poll loop")
 
         self._last_message_date = await self._get_server_latest_timestamp()
@@ -388,29 +418,11 @@ class IMessageChannel(BaseChannel):
                 logger.warning("iMessage remote poll error: {}", e)
             await asyncio.sleep(poll_interval)
 
-    async def _health_check(self) -> bool:
-        """``GET /health`` — verify the proxy is reachable."""
-        if not self._http:
-            return False
-        try:
-            resp = await self._http.get("/health")
-            if resp.is_success:
-                logger.info("iMessage server health check passed")
-                return True
-            logger.warning("iMessage health check HTTP {}", resp.status_code)
-        except Exception as e:
-            logger.warning("iMessage health check failed: {}", e)
-        return False
-
     async def _get_server_latest_timestamp(self) -> int:
-        """Fetch the most recent message timestamp to seed the poll cursor."""
         try:
-            resp = await self._http.get("/messages", params={"limit": 1})  # type: ignore[union-attr]
-            if resp.is_success:
-                body = resp.json()
-                messages = body.get("data") if isinstance(body, dict) else body
-                if isinstance(messages, list) and messages:
-                    return messages[0].get("dateCreated", 0)
+            resp = await self._api_get_messages(limit=1)
+            if resp and isinstance(resp, list) and resp:
+                return resp[0].get("dateCreated", 0)
         except Exception as e:
             logger.debug("Could not seed latest timestamp: {}", e)
         return 0
@@ -421,23 +433,11 @@ class IMessageChannel(BaseChannel):
         if not self._http:
             return
 
-        params: dict[str, Any] = {"limit": 50}
-        if self._last_message_date:
-            params["after"] = self._last_message_date
-
-        try:
-            resp = await self._http.get("/messages", params=params)
-        except httpx.HTTPError as e:
-            logger.warning("iMessage poll request failed: {}", e)
-            return
-
-        if not resp.is_success:
-            logger.warning("iMessage poll HTTP {}: {}", resp.status_code, resp.text[:200])
-            return
-
-        body = resp.json()
-        messages: list[dict[str, Any]] = body.get("data") if isinstance(body, dict) else body
-        if not isinstance(messages, list):
+        messages = await self._api_get_messages(
+            limit=50,
+            after=self._last_message_date if self._last_message_date else None,
+        )
+        if not messages:
             return
 
         for msg in reversed(messages):
@@ -473,8 +473,8 @@ class IMessageChannel(BaseChannel):
         if is_group and self.config.group_policy == "mention":
             return
 
-        await self._add_tapback(address, message_id)
-        await self._mark_read(address)
+        await self._api_react(address, message_id, self.config.react_tapback)
+        await self._api_mark_read(address)
 
         media_paths: list[str] = []
         for att in data.get("attachments") or []:
@@ -483,7 +483,7 @@ class IMessageChannel(BaseChannel):
             if not att_guid or not self._http:
                 continue
 
-            local_path = await self._download_attachment(att_guid, name)
+            local_path = await self._api_download_attachment(att_guid, name)
             if not local_path:
                 continue
 
@@ -524,51 +524,170 @@ class IMessageChannel(BaseChannel):
             return
 
         to = msg.chat_id
+        is_progress = (msg.metadata or {}).get("_progress", False)
 
-        await self._start_typing(to)
+        if not is_progress:
+            await self._api_start_typing(to)
 
         if msg.content:
             body: dict[str, Any] = {"to": to, "text": msg.content}
             if self.config.reply_to_message and msg.reply_to:
                 body["replyTo"] = msg.reply_to
             try:
-                await self._http.post("/send", json=body)
+                await self._api_send(body)
             except Exception as e:
                 logger.error("iMessage remote send failed: {}", e)
                 raise
             finally:
-                await self._stop_typing(to)
+                if not is_progress:
+                    await self._api_stop_typing(to)
 
         for media_path in msg.media or []:
             try:
-                mime, _ = mimetypes.guess_type(media_path)
-                with open(media_path, "rb") as f:
-                    await self._http.post(
-                        "/send/file",
-                        data={"to": to},
-                        files={"file": (Path(media_path).name, f, mime or "application/octet-stream")},
-                    )
+                await self._api_send_file(to, media_path)
             except Exception as e:
                 logger.error("iMessage remote media send failed: {}", e)
                 raise
 
-    # ---- remote helpers (best-effort, non-blocking) ------------------------
+        if not is_progress:
+            message_id = (msg.metadata or {}).get("message_id")
+            if message_id and self.config.react_tapback:
+                await self._api_remove_react(to, message_id, self.config.react_tapback)
+                if self.config.done_tapback:
+                    await self._api_react(to, message_id, self.config.done_tapback)
 
-    async def _add_tapback(self, address: str, message_guid: str) -> None:
-        """``POST /messages/:id/react`` — add tapback on inbound message."""
-        reaction = self.config.react_tapback
-        if not self._http or not reaction:
+    # ======================================================================
+    # PROXY API METHODS
+    # https://github.com/photon-hq/advanced-imessage-http-proxy
+    # ======================================================================
+
+    # ---- messaging ---------------------------------------------------------
+
+    async def _api_send(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """``POST /send`` — send text message with optional effect / reply."""
+        return await self._post("/send", body)
+
+    async def _api_send_file(self, to: str, file_path: str, audio: bool | None = None) -> dict[str, Any] | None:
+        """``POST /send/file`` — send attachment (image, file, audio message)."""
+        if not self._http:
+            return None
+        mime, _ = mimetypes.guess_type(file_path)
+        ext = Path(file_path).suffix.lower()
+        is_audio = audio if audio is not None else (ext in _AUDIO_EXTENSIONS or (mime or "").startswith("audio/"))
+        data: dict[str, str] = {"to": to}
+        if is_audio:
+            data["audio"] = "true"
+        with open(file_path, "rb") as f:
+            resp = await self._http.post(
+                "/send/file",
+                data=data,
+                files={"file": (Path(file_path).name, f, mime or "application/octet-stream")},
+            )
+        return self._unwrap(resp)
+
+    async def _api_send_sticker(
+        self, to: str, file_path: str, reply_to: str | None = None, **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        """``POST /send/sticker`` — send standalone or reply sticker."""
+        if not self._http:
+            return None
+        data: dict[str, str] = {"to": to}
+        if reply_to:
+            data["replyTo"] = reply_to
+        for k in ("stickerX", "stickerY", "stickerScale", "stickerRotation", "stickerWidth"):
+            if k in kwargs:
+                data[k] = str(kwargs[k])
+        with open(file_path, "rb") as f:
+            resp = await self._http.post(
+                "/send/sticker",
+                data=data,
+                files={"file": (Path(file_path).name, f, "image/png")},
+            )
+        return self._unwrap(resp)
+
+    async def _api_unsend(self, message_id: str) -> dict[str, Any] | None:
+        """``DELETE /messages/:id`` — retract a sent message."""
+        return await self._delete(f"/messages/{message_id}")
+
+    # ---- reactions ---------------------------------------------------------
+
+    async def _api_react(self, chat: str, message_id: str, tapback: str) -> None:
+        """``POST /messages/:id/react`` — add tapback (best-effort)."""
+        if not self._http or not tapback:
             return
         try:
             await self._http.post(
-                f"/messages/{message_guid}/react",
-                json={"chat": address, "type": reaction},
+                f"/messages/{message_id}/react",
+                json={"chat": chat, "type": tapback},
             )
         except Exception as e:
             logger.debug("iMessage tapback failed: {}", e)
 
-    async def _mark_read(self, address: str) -> None:
-        """``POST /chats/:id/read`` — clear unread badge after processing."""
+    async def _api_remove_react(self, chat: str, message_id: str, tapback: str) -> None:
+        """``DELETE /messages/:id/react`` — remove tapback (best-effort)."""
+        if not self._http or not tapback:
+            return
+        try:
+            await self._http.request(
+                "DELETE", f"/messages/{message_id}/react",
+                json={"chat": chat, "type": tapback},
+            )
+        except Exception as e:
+            logger.debug("iMessage remove tapback failed: {}", e)
+
+    # ---- messages ----------------------------------------------------------
+
+    async def _api_get_messages(
+        self, limit: int = 50, chat: str | None = None, after: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """``GET /messages`` — query messages."""
+        params: dict[str, Any] = {"limit": limit}
+        if chat:
+            params["chat"] = chat
+        if after:
+            params["after"] = after
+        data = await self._get("/messages", params=params)
+        return data if isinstance(data, list) else []
+
+    async def _api_search_messages(self, query: str, chat: str | None = None) -> list[dict[str, Any]]:
+        """``GET /messages/search`` — search messages by text."""
+        params: dict[str, Any] = {"q": query}
+        if chat:
+            params["chat"] = chat
+        data = await self._get("/messages/search", params=params)
+        return data if isinstance(data, list) else []
+
+    async def _api_get_message(self, message_id: str) -> dict[str, Any] | None:
+        """``GET /messages/:id`` — get single message details."""
+        data = await self._get(f"/messages/{message_id}")
+        return data if isinstance(data, dict) else None
+
+    # ---- chats -------------------------------------------------------------
+
+    async def _api_get_chats(self) -> list[dict[str, Any]]:
+        """``GET /chats`` — list all conversations."""
+        data = await self._get("/chats")
+        return data if isinstance(data, list) else []
+
+    async def _api_get_chat(self, address: str) -> dict[str, Any] | None:
+        """``GET /chats/:id`` — get chat details."""
+        data = await self._get(f"/chats/{address}")
+        return data if isinstance(data, dict) else None
+
+    async def _api_get_chat_messages(
+        self, address: str, limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """``GET /chats/:id/messages`` — get message history for a chat."""
+        data = await self._get(f"/chats/{address}/messages", params={"limit": limit})
+        return data if isinstance(data, list) else []
+
+    async def _api_get_chat_participants(self, address: str) -> list[dict[str, Any]]:
+        """``GET /chats/:id/participants`` — get group participants."""
+        data = await self._get(f"/chats/{address}/participants")
+        return data if isinstance(data, list) else []
+
+    async def _api_mark_read(self, address: str) -> None:
+        """``POST /chats/:id/read`` — clear unread badge."""
         if not self._http:
             return
         try:
@@ -576,7 +695,7 @@ class IMessageChannel(BaseChannel):
         except Exception as e:
             logger.debug("iMessage mark-read failed: {}", e)
 
-    async def _start_typing(self, address: str) -> None:
+    async def _api_start_typing(self, address: str) -> None:
         """``POST /chats/:id/typing`` — show typing indicator."""
         if not self._http:
             return
@@ -585,7 +704,7 @@ class IMessageChannel(BaseChannel):
         except Exception as e:
             logger.debug("iMessage typing start failed: {}", e)
 
-    async def _stop_typing(self, address: str) -> None:
+    async def _api_stop_typing(self, address: str) -> None:
         """``DELETE /chats/:id/typing`` — stop typing indicator."""
         if not self._http:
             return
@@ -594,7 +713,50 @@ class IMessageChannel(BaseChannel):
         except Exception as e:
             logger.debug("iMessage typing stop failed: {}", e)
 
-    async def _download_attachment(self, att_guid: str, filename: str) -> str | None:
+    # ---- groups ------------------------------------------------------------
+
+    async def _api_create_group(self, members: list[str], name: str | None = None) -> dict[str, Any] | None:
+        """``POST /groups`` — create a group chat."""
+        body: dict[str, Any] = {"members": members}
+        if name:
+            body["name"] = name
+        return await self._post("/groups", body)
+
+    async def _api_update_group(self, group_id: str, name: str) -> dict[str, Any] | None:
+        """``PATCH /groups/:id`` — rename a group."""
+        if not self._http:
+            return None
+        resp = await self._http.patch(f"/groups/{group_id}", json={"name": name})
+        return self._unwrap(resp)
+
+    # ---- polls -------------------------------------------------------------
+
+    async def _api_create_poll(
+        self, to: str, question: str, options: list[str],
+    ) -> dict[str, Any] | None:
+        """``POST /polls`` — create an interactive poll."""
+        return await self._post("/polls", {"to": to, "question": question, "options": options})
+
+    async def _api_get_poll(self, poll_id: str) -> dict[str, Any] | None:
+        """``GET /polls/:id`` — get poll details."""
+        data = await self._get(f"/polls/{poll_id}")
+        return data if isinstance(data, dict) else None
+
+    async def _api_vote_poll(self, poll_id: str, chat: str, option_id: str) -> dict[str, Any] | None:
+        """``POST /polls/:id/vote`` — vote on a poll option."""
+        return await self._post(f"/polls/{poll_id}/vote", {"chat": chat, "optionId": option_id})
+
+    async def _api_unvote_poll(self, poll_id: str, chat: str, option_id: str) -> dict[str, Any] | None:
+        """``POST /polls/:id/unvote`` — remove vote from poll."""
+        return await self._post(f"/polls/{poll_id}/unvote", {"chat": chat, "optionId": option_id})
+
+    async def _api_add_poll_option(self, poll_id: str, chat: str, text: str) -> dict[str, Any] | None:
+        """``POST /polls/:id/options`` — add option to existing poll."""
+        return await self._post(f"/polls/{poll_id}/options", {"chat": chat, "text": text})
+
+    # ---- attachments -------------------------------------------------------
+
+    async def _api_download_attachment(self, att_guid: str, filename: str) -> str | None:
         """``GET /attachments/:id`` — download to local media dir."""
         if not self._http:
             return None
@@ -610,6 +772,85 @@ class IMessageChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to download iMessage attachment {}: {}", att_guid, e)
             return None
+
+    async def _api_attachment_info(self, att_guid: str) -> dict[str, Any] | None:
+        """``GET /attachments/:id/info`` — get attachment metadata."""
+        data = await self._get(f"/attachments/{att_guid}/info")
+        return data if isinstance(data, dict) else None
+
+    # ---- contacts & handles ------------------------------------------------
+
+    async def _api_check_imessage(self, address: str) -> bool:
+        """``GET /check/:address`` — check if address uses iMessage."""
+        data = await self._get(f"/check/{address}")
+        if isinstance(data, dict):
+            return bool(data.get("available") or data.get("imessage"))
+        return False
+
+    async def _api_get_contacts(self) -> list[dict[str, Any]]:
+        """``GET /contacts`` — list device contacts."""
+        data = await self._get("/contacts")
+        return data if isinstance(data, list) else []
+
+    async def _api_get_handles(self) -> list[dict[str, Any]]:
+        """``GET /handles`` — list known handles."""
+        data = await self._get("/handles")
+        return data if isinstance(data, list) else []
+
+    # ---- server ------------------------------------------------------------
+
+    async def _api_server_info(self) -> dict[str, Any] | None:
+        """``GET /server`` — get server info."""
+        data = await self._get("/server")
+        return data if isinstance(data, dict) else None
+
+    async def _api_health(self) -> bool:
+        """``GET /health`` — basic health check."""
+        if not self._http:
+            return False
+        try:
+            resp = await self._http.get("/health")
+            if resp.is_success:
+                logger.info("iMessage server health check passed")
+                return True
+            logger.warning("iMessage health check HTTP {}", resp.status_code)
+        except Exception as e:
+            logger.warning("iMessage health check failed: {}", e)
+        return False
+
+    # ---- HTTP helpers ------------------------------------------------------
+
+    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self._http:
+            return None
+        try:
+            resp = await self._http.get(path, params=params)
+            return self._unwrap(resp)
+        except Exception as e:
+            logger.warning("iMessage GET {} failed: {}", path, e)
+            return None
+
+    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._http:
+            return None
+        resp = await self._http.post(path, json=body)
+        return self._unwrap(resp)
+
+    async def _delete(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        if not self._http:
+            return None
+        resp = await self._http.request("DELETE", path, json=body)
+        return self._unwrap(resp)
+
+    @staticmethod
+    def _unwrap(resp: httpx.Response) -> Any:
+        """Unwrap the proxy's ``{"ok": true, "data": ...}`` envelope."""
+        if not resp.is_success:
+            return None
+        body = resp.json()
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return body
 
     # ---- dedup helper ------------------------------------------------------
 
