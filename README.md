@@ -253,6 +253,7 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
 | **Wecom** | Bot ID + Bot Secret |
+| **iMessage** | macOS (local) or Photon server credentials (remote) |
 | **Mochat** | Claw token (auto-setup available) |
 
 <details>
@@ -819,6 +820,80 @@ Go to the WeCom admin console → Intelligent Robot → Create Robot → select 
 ```bash
 nanobot gateway
 ```
+
+</details>
+
+<details>
+<summary><b>iMessage</b></summary>
+
+Supports two modes via [Photon](https://photon.codes)'s iMessage SDKs:
+
+- **Local mode**: Runs directly on macOS using [`@photon-ai/imessage-kit`](https://github.com/photon-hq/imessage-kit). Reads the on-device iMessage database and sends via AppleScript. No external server needed.
+- **Remote mode**: Connects to a Photon-managed iMessage server using [`@photon-ai/advanced-imessage-kit`](https://github.com/photon-hq/advanced-imessage-kit). Runs on any platform with full-featured support (reactions, typing indicators, message editing, polls, and more).
+
+Requires **Node.js ≥ 18**.
+
+**Local mode (macOS)**
+
+1. Grant **Full Disk Access** to your terminal in **System Settings → Privacy & Security → Full Disk Access**
+2. Ensure iMessage is signed in and working on the Mac
+
+```json
+{
+  "channels": {
+    "imessage": {
+      "enabled": true,
+      "local": true,
+      "allowFrom": ["+1234567890"]
+    }
+  }
+}
+```
+
+```bash
+nanobot gateway
+```
+
+> Local mode supports sending/receiving text, images, and files. For reactions, typing indicators, message editing, and polls, use remote mode.
+
+**Remote mode (Photon cloud, any platform)**
+
+1. Get your **Server URL** and **API Key** from the [Photon dashboard](https://photon.codes)
+2. Configure:
+
+```json
+{
+  "channels": {
+    "imessage": {
+      "enabled": true,
+      "local": false,
+      "serverUrl": "http://your-photon-server:1234",
+      "apiKey": "your-api-key",
+      "allowFrom": ["+1234567890"]
+    }
+  }
+}
+```
+
+```bash
+nanobot gateway
+```
+
+> `allowFrom`: Add phone numbers or email addresses. Use `["*"]` to allow all senders.
+> `groupPolicy`: `"open"` (default — respond to all messages) or `"mention"` (respond only when mentioned in groups).
+
+**Feature comparison:**
+
+| Feature | Local | Remote |
+|---------|-------|--------|
+| Send/receive messages | ✅ | ✅ |
+| Images & files | ✅ | ✅ |
+| Message history | ✅ | ✅ |
+| Reactions (tapbacks) | ❌ | ✅ |
+| Typing indicators | ❌ | ✅ |
+| Message editing | ❌ | ✅ |
+| Polls | ❌ | ✅ |
+| Runs on any platform | ❌ | ✅ |
 
 </details>
 

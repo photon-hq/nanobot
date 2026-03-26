@@ -100,11 +100,13 @@ packages = ["nanobot"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "bridge" = "nanobot/bridge"
+"bridge-imessage" = "nanobot/bridge-imessage"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "nanobot/",
     "bridge/",
+    "bridge-imessage/",
     "README.md",
     "LICENSE",
 ]
