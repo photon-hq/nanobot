@@ -826,12 +826,10 @@ nanobot gateway
 <details>
 <summary><b>iMessage</b></summary>
 
-Supports two modes via [Photon](https://photon.codes)'s iMessage SDKs:
+Supports two modes via [Photon](https://photon.codes)'s iMessage platform:
 
-- **Local mode**: Runs directly on macOS using [`@photon-ai/imessage-kit`](https://github.com/photon-hq/imessage-kit). Reads the on-device iMessage database and sends via AppleScript. No external server needed.
-- **Remote mode**: Connects to a Photon-managed iMessage server using [`@photon-ai/advanced-imessage-kit`](https://github.com/photon-hq/advanced-imessage-kit). Runs on any platform with full-featured support (reactions, typing indicators, message editing, polls, and more).
-
-Requires **Node.js ≥ 18**.
+- **Local mode**: Runs directly on macOS. Reads the on-device iMessage database and sends via AppleScript. No external server needed. Based on the same approach as [`@photon-ai/imessage-kit`](https://github.com/photon-hq/imessage-kit).
+- **Remote mode**: Connects to a Photon-managed iMessage server (powered by [`@photon-ai/advanced-imessage-kit`](https://github.com/photon-hq/advanced-imessage-kit)) over HTTP + Socket.IO. Runs on any platform with full-featured support (reactions, typing indicators, message editing, and more).
 
 **Local mode (macOS)**
 
@@ -854,9 +852,9 @@ Requires **Node.js ≥ 18**.
 nanobot gateway
 ```
 
-> Local mode supports sending/receiving text, images, and files. For reactions, typing indicators, message editing, and polls, use remote mode.
+> Local mode supports sending/receiving text, images, and files. For reactions, typing indicators, and message editing, use remote mode.
 
-**Remote mode (Photon cloud, any platform)**
+**Remote mode ([Photon](https://photon.codes) cloud, any platform)**
 
 1. Get your **Server URL** and **API Key** from the [Photon dashboard](https://photon.codes)
 2. Configure:
@@ -892,7 +890,6 @@ nanobot gateway
 | Reactions (tapbacks) | ❌ | ✅ |
 | Typing indicators | ❌ | ✅ |
 | Message editing | ❌ | ✅ |
-| Polls | ❌ | ✅ |
 | Runs on any platform | ❌ | ✅ |
 
 </details>
