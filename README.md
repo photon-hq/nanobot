@@ -829,7 +829,7 @@ nanobot gateway
 Supports two modes via [Photon](https://photon.codes)'s iMessage platform:
 
 - **Local mode**: Runs directly on macOS. Reads the on-device iMessage database and sends via AppleScript. No external server needed. Based on the same approach as [`@photon-ai/imessage-kit`](https://github.com/photon-hq/imessage-kit).
-- **Remote mode**: Connects to a Photon-managed iMessage server (powered by [`@photon-ai/advanced-imessage-kit`](https://github.com/photon-hq/advanced-imessage-kit)) over HTTP + Socket.IO. Runs on any platform with full-featured support (reactions, typing indicators, message editing, and more).
+- **Remote mode**: Connects to a Photon-managed iMessage server (powered by [`@photon-ai/advanced-imessage-kit`](https://github.com/photon-hq/advanced-imessage-kit)) over pure HTTP. Runs on any platform with full-featured support (reactions, typing indicators, message editing, and more). Supports HTTP proxy.
 
 **Local mode (macOS)**
 
@@ -879,6 +879,8 @@ nanobot gateway
 
 > `allowFrom`: Add phone numbers or email addresses. Use `["*"]` to allow all senders.
 > `groupPolicy`: `"open"` (default — respond to all messages) or `"mention"` (respond only when mentioned in groups).
+> `proxy`: Optional HTTP proxy URL (e.g. `"http://127.0.0.1:7890"`) — all Photon traffic routes through it.
+> `pollInterval`: Polling interval in seconds (default `2.0`).
 
 **Feature comparison:**
 

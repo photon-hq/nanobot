@@ -7,21 +7,17 @@ Supports two modes via Photon's iMessage platform:
   AppleScript.  No external server required.
 
   **Remote** — Any platform.  Connects to a Photon-managed iMessage
-  server over HTTP + Socket.IO using ``httpx`` and ``python-socketio``.
-  Supports the full feature set: reactions, typing indicators, message
-  editing, polls, and file attachments.
+  server over pure HTTP using ``httpx``.  Polls for new messages and
+  sends via REST API.  Supports HTTP proxy for all traffic.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import mimetypes
-import os
 import platform
 import sqlite3
 import subprocess
-import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
@@ -36,16 +32,9 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 
-try:
-    import socketio
-
-    SOCKETIO_AVAILABLE = True
-except ImportError:
-    socketio = None  # type: ignore[assignment]
-    SOCKETIO_AVAILABLE = False
-
 _DEFAULT_DB_PATH = str(Path.home() / "Library" / "Messages" / "chat.db")
-_LOCAL_POLL_INTERVAL = 2.0  # seconds between local DB polls
+_LOCAL_POLL_INTERVAL = 2.0
+_REMOTE_POLL_INTERVAL = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +49,8 @@ class IMessageConfig(Base):
     local: bool = True
     server_url: str = ""
     api_key: str = ""
+    proxy: str | None = None
+    poll_interval: float = _REMOTE_POLL_INTERVAL
     database_path: str = _DEFAULT_DB_PATH
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
@@ -76,8 +67,9 @@ class IMessageChannel(BaseChannel):
     Local mode reads from the native iMessage SQLite database and sends
     via AppleScript — pure Python, no external dependencies.
 
-    Remote mode uses HTTP + Socket.IO to talk to a Photon iMessage server,
-    following the same pattern as the Mochat channel.
+    Remote mode uses pure HTTP to talk to a Photon iMessage server,
+    polling for new messages via the REST API.  All traffic goes through
+    ``httpx`` so the optional ``proxy`` config is respected everywhere.
     """
 
     name = "imessage"
@@ -94,9 +86,8 @@ class IMessageChannel(BaseChannel):
         self.config: IMessageConfig = config
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
         self._http: httpx.AsyncClient | None = None
-        self._sio: Any = None
-        self._sio_connected = False
         self._last_rowid: int = 0
+        self._last_message_date: int = 0
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -108,13 +99,6 @@ class IMessageChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
-        if self._sio:
-            try:
-                await self._sio.disconnect()
-            except Exception:
-                pass
-            self._sio = None
-        self._sio_connected = False
         if self._http:
             await self._http.aclose()
             self._http = None
@@ -279,8 +263,20 @@ class IMessageChannel(BaseChannel):
             raise
 
     # ======================================================================
-    # REMOTE MODE  (Photon server — httpx + Socket.IO)
+    # REMOTE MODE  (Photon server — pure HTTP polling)
     # ======================================================================
+
+    def _build_http_client(self) -> httpx.AsyncClient:
+        proxy = self.config.proxy or None
+        return httpx.AsyncClient(
+            base_url=self.config.server_url.rstrip("/"),
+            headers={
+                "X-API-Key": self.config.api_key,
+                "Content-Type": "application/json",
+            },
+            proxy=proxy,
+            timeout=30.0,
+        )
 
     async def _start_remote(self) -> None:
         if not self.config.server_url:
@@ -289,67 +285,75 @@ class IMessageChannel(BaseChannel):
         if not self.config.api_key:
             logger.error("iMessage remote mode requires apiKey")
             return
-        if not SOCKETIO_AVAILABLE:
-            logger.error("python-socketio required for iMessage remote mode (already a nanobot dependency)")
-            return
 
         self._running = True
-        self._http = httpx.AsyncClient(
-            base_url=self.config.server_url.rstrip("/"),
-            headers={
-                "X-API-Key": self.config.api_key,
-                "Content-Type": "application/json",
-            },
-            timeout=30.0,
-        )
+        self._http = self._build_http_client()
 
-        await self._connect_socketio()
+        self._last_message_date = await self._get_server_latest_timestamp()
+        poll_interval = max(0.5, self.config.poll_interval)
+        logger.info(
+            "iMessage remote polling started ({}s interval, proxy={})",
+            poll_interval,
+            self.config.proxy or "none",
+        )
 
         while self._running:
-            await asyncio.sleep(1)
+            try:
+                await self._poll_remote()
+            except Exception as e:
+                logger.warning("iMessage remote poll error: {}", e)
+            await asyncio.sleep(poll_interval)
 
-    async def _connect_socketio(self) -> None:
-        client = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_delay=2,
-            reconnection_delay_max=10,
-            logger=False,
-            engineio_logger=False,
-        )
-
-        @client.event
-        async def connect() -> None:
-            self._sio_connected = True
-            logger.info("Connected to Photon iMessage server")
-
-        @client.event
-        async def disconnect() -> None:
-            if not self._running:
-                return
-            self._sio_connected = False
-            logger.warning("Disconnected from Photon iMessage server")
-
-        @client.on("new-message")
-        async def on_new_message(data: Any) -> None:
-            await self._handle_remote_message(data)
-
-        self._sio = client
-
-        server_url = self.config.server_url.rstrip("/")
+    async def _get_server_latest_timestamp(self) -> int:
+        """Fetch the most recent message timestamp so we only poll forward."""
         try:
-            await client.connect(
-                server_url,
-                transports=["websocket"],
-                auth={"apiKey": self.config.api_key},
-                wait_timeout=10,
+            resp = await self._http.get(  # type: ignore[union-attr]
+                "/api/v1/message",
+                params={"limit": 1, "sort": "DESC"},
             )
+            if resp.is_success:
+                data = resp.json()
+                messages = data.get("data") or data if isinstance(data, list) else []
+                if isinstance(data, dict):
+                    messages = data.get("data") or data.get("messages") or []
+                if messages and isinstance(messages, list):
+                    return messages[0].get("dateCreated", 0)
         except Exception as e:
-            logger.error("Failed to connect to Photon iMessage server: {}", e)
-            self._sio_connected = False
+            logger.debug("Could not seed latest timestamp: {}", e)
+        return 0
 
-    async def _handle_remote_message(self, data: Any) -> None:
-        if not isinstance(data, dict):
+    async def _poll_remote(self) -> None:
+        if not self._http:
             return
+
+        params: dict[str, Any] = {"sort": "DESC", "limit": 50}
+        if self._last_message_date:
+            params["after"] = self._last_message_date
+
+        try:
+            resp = await self._http.get("/api/v1/message", params=params)
+        except httpx.HTTPError as e:
+            logger.warning("iMessage poll request failed: {}", e)
+            return
+
+        if not resp.is_success:
+            logger.warning("iMessage poll HTTP {}: {}", resp.status_code, resp.text[:200])
+            return
+
+        data = resp.json()
+        messages: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            messages = data
+        elif isinstance(data, dict):
+            messages = data.get("data") or data.get("messages") or []
+
+        for msg in reversed(messages):
+            ts = msg.get("dateCreated", 0)
+            if isinstance(ts, int) and ts > self._last_message_date:
+                self._last_message_date = ts
+            await self._handle_remote_message(msg)
+
+    async def _handle_remote_message(self, data: dict[str, Any]) -> None:
         if data.get("isFromMe"):
             return
 
@@ -377,10 +381,16 @@ class IMessageChannel(BaseChannel):
 
         media_paths: list[str] = []
         for att in data.get("attachments") or []:
+            att_guid = att.get("guid", "")
             name = att.get("transferName") or att.get("filename") or ""
-            if name:
-                media_tag = f"[file: {name}]"
-                content = f"{content}\n{media_tag}" if content else media_tag
+            if att_guid and self._http:
+                local_path = await self._download_attachment(att_guid, name)
+                if local_path:
+                    media_paths.append(local_path)
+                    mime, _ = mimetypes.guess_type(local_path)
+                    tag = "image" if mime and mime.startswith("image/") else "file"
+                    media_tag = f"[{tag}: {local_path}]"
+                    content = f"{content}\n{media_tag}" if content else media_tag
 
         await self._handle_message(
             sender_id=sender,
@@ -394,6 +404,23 @@ class IMessageChannel(BaseChannel):
                 "timestamp": data.get("dateCreated"),
             },
         )
+
+    async def _download_attachment(self, att_guid: str, filename: str) -> str | None:
+        """Download an attachment from the Photon server to local media dir."""
+        if not self._http:
+            return None
+        try:
+            resp = await self._http.get(f"/api/v1/attachment/{att_guid}/download")
+            if not resp.is_success:
+                return None
+            media_dir = get_media_dir("imessage")
+            safe_name = filename or f"{att_guid}.bin"
+            dest = media_dir / safe_name
+            dest.write_bytes(resp.content)
+            return str(dest)
+        except Exception as e:
+            logger.warning("Failed to download iMessage attachment {}: {}", att_guid, e)
+            return None
 
     async def _send_remote(self, msg: OutboundMessage) -> None:
         if not self._http:
