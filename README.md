@@ -253,6 +253,7 @@ Connect nanobot to your favorite chat platform. Want to build your own? See the 
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
 | **Wecom** | Bot ID + Bot Secret |
+| **iMessage** | macOS (local) or Photon server credentials (remote) |
 | **Mochat** | Claw token (auto-setup available) |
 
 <details>
@@ -819,6 +820,80 @@ Go to the WeCom admin console → Intelligent Robot → Create Robot → select 
 ```bash
 nanobot gateway
 ```
+
+</details>
+
+<details>
+<summary><b>iMessage</b></summary>
+
+Supports two modes via [Photon](https://photon.codes)'s iMessage platform:
+
+- **Local mode**: Runs directly on macOS. Reads the on-device iMessage database and sends via AppleScript. No external server needed. Based on the same approach as [`@photon-ai/imessage-kit`](https://github.com/photon-hq/imessage-kit).
+- **Remote mode**: Connects to a Photon [`advanced-imessage-http-proxy`](https://github.com/photon-hq/advanced-imessage-http-proxy) server over pure HTTP. Runs on any platform with full-featured support (tapback reactions, typing indicators, mark-as-read, attachments, inline replies). Supports HTTP proxy.
+
+**Local mode (macOS)**
+
+1. Grant **Full Disk Access** to your terminal in **System Settings → Privacy & Security → Full Disk Access**
+2. Ensure iMessage is signed in and working on the Mac
+
+```json
+{
+  "channels": {
+    "imessage": {
+      "enabled": true,
+      "local": true,
+      "allowFrom": ["+1234567890"]
+    }
+  }
+}
+```
+
+```bash
+nanobot gateway
+```
+
+> Local mode supports sending/receiving text, images, and files. For reactions, typing indicators, and message editing, use remote mode.
+
+**Remote mode ([Photon](https://photon.codes) cloud, any platform)**
+
+1. Set up [advanced-imessage-http-proxy](https://github.com/photon-hq/advanced-imessage-http-proxy) (self-hosted or Photon-managed)
+2. Get your **Server URL** and **API Key**
+3. Configure:
+
+```json
+{
+  "channels": {
+    "imessage": {
+      "enabled": true,
+      "local": false,
+      "serverUrl": "http://your-photon-server:1234",
+      "apiKey": "your-api-key",
+      "allowFrom": ["+1234567890"]
+    }
+  }
+}
+```
+
+```bash
+nanobot gateway
+```
+
+> `allowFrom`: Add phone numbers or email addresses. Use `["*"]` to allow all senders.
+> `groupPolicy`: `"open"` (default — respond to all messages) or `"mention"` (respond only when mentioned in groups).
+> `proxy`: Optional HTTP proxy URL (e.g. `"http://127.0.0.1:7890"`) — all Photon traffic routes through it.
+> `pollInterval`: Polling interval in seconds (default `2.0`).
+
+**Feature comparison:**
+
+| Feature | Local | Remote |
+|---------|-------|--------|
+| Send/receive messages | ✅ | ✅ |
+| Images & files | ✅ | ✅ |
+| Message history | ✅ | ✅ |
+| Reactions (tapbacks) | ❌ | ✅ |
+| Typing indicators | ❌ | ✅ |
+| Mark as read | ❌ | ✅ |
+| Runs on any platform | ❌ | ✅ |
 
 </details>
 
