@@ -24,11 +24,10 @@ from nanobot.config.schema import Base
 from nanobot.utils.helpers import split_message
 
 _DEFAULT_DB_PATH = str(Path.home() / "Library" / "Messages" / "chat.db")
-_LOCAL_POLL_INTERVAL = 2.0
-_REMOTE_POLL_INTERVAL = 2.0
+_DEFAULT_POLL_INTERVAL = 2.0
 
 _AUDIO_EXTENSIONS = frozenset({".m4a", ".mp3", ".wav", ".aac", ".ogg", ".caf", ".opus"})
-_MAX_MESSAGE_LEN = 20000
+_MAX_MESSAGE_LEN = 6000
 
 
 def _split_paragraphs(text: str) -> list[str]:
@@ -54,7 +53,7 @@ class IMessageConfig(Base):
     server_url: str = ""
     api_key: str = ""
     proxy: str | None = None
-    poll_interval: float = _REMOTE_POLL_INTERVAL
+    poll_interval: float = _DEFAULT_POLL_INTERVAL
     database_path: str = _DEFAULT_DB_PATH
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "ignore"] = "open"
@@ -104,7 +103,8 @@ def _resolve_proxy_url(server_url: str) -> str:
     """
     if _is_photon_kit_url(server_url):
         logger.info(
-            "Photon Kit URL detected — routing through proxy at {}",
+            "Photon Kit URL detected — routing through proxy at {} "
+            "(hosted by Photon, the same provider as your iMessage Kit server).",
             _PHOTON_PROXY_URL,
         )
         return _PHOTON_PROXY_URL
@@ -204,7 +204,7 @@ class IMessageChannel(BaseChannel):
                 await self._poll_local_db(db_path)
             except Exception as e:
                 logger.warning("iMessage local poll error: {}", e)
-            await asyncio.sleep(_LOCAL_POLL_INTERVAL)
+            await asyncio.sleep(max(0.5, self.config.poll_interval))
 
     def _get_max_rowid(self, db_path: str) -> int:
         try:
@@ -223,7 +223,20 @@ class IMessageChannel(BaseChannel):
             self._last_rowid = max(self._last_rowid, int(row["ROWID"]))
 
     def _fetch_new_messages(self, db_path: str) -> list[dict[str, Any]]:
-        with sqlite3.connect(db_path, uri=True) as conn:
+        for attempt in range(3):
+            try:
+                return self._query_new_messages(db_path)
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) and attempt < 2:
+                    import time
+
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        return []
+
+    def _query_new_messages(self, db_path: str) -> list[dict[str, Any]]:
+        with sqlite3.connect(db_path, uri=True, timeout=10) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute(
                 """
@@ -338,7 +351,13 @@ class IMessageChannel(BaseChannel):
 
     @staticmethod
     def _escape_applescript(s: str) -> str:
-        return s.replace("\\", "\\\\").replace('"', '\\"')
+        return (
+            s.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
 
     async def _applescript_send_text(self, recipient: str, text: str) -> None:
         escaped_recipient = self._escape_applescript(recipient)
